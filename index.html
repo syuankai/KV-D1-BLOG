@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>科技脈動 Blog - Cloudflare D1/AI Demo</title>
+    <title>科技脈動 Blog - Cloudflare D1/KV Demo</title>
     <!-- 引入 Tailwind CSS CDN -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- 引入 Font Awesome 5.15.4 (用於圖示) -->
@@ -54,7 +54,7 @@
     <!-- 底部版權資訊 (Footer) -->
     <footer class="bg-gray-800 text-white p-6 text-center mt-auto">
         <p class="text-sm">© <span id="current-year"></span> 科技脈動 Blog. 版權所有.</p>
-        <p class="text-xs mt-1">應用程式架構: Cloudflare Pages (Frontend) + Cloudflare Worker (Backend, D1/KV/AI).</p>
+        <p class="text-xs mt-1">應用程式架構: Cloudflare Pages (Frontend) + Cloudflare Worker (Backend, D1/KV).</p>
         <p class="text-xs mt-1">當前用戶: <span id="current-user-info" class="font-mono text-indigo-400">正在檢查...</span></p>
     </footer>
 
@@ -211,10 +211,8 @@
             const userToken = localStorage.getItem('userToken');
             // 我們假設 token 存在即代表用戶會話有效
             if (userToken) {
-                // 由於後端 Worker 使用 Token (即 userId) 進行身份驗證，我們在這裡模擬一個檢查。
-                // 為了避免每次刷新都觸發 API 請求，這裡先假設用戶已登入。
-                // 理想情況下，應該呼叫 /profile 端點來驗證 token 和獲取用戶角色。
-                const tokenPayload = userToken.split('.'); // 簡單解構 token
+                // 簡單解構 token 來模擬身份資訊 (這在生產環境應呼叫 /profile 端點)
+                const tokenPayload = userToken.split('.'); 
                 const username = tokenPayload[0] || 'User'; 
                 const role = tokenPayload[1] === 'admin' ? 'admin' : 'user';
 
@@ -257,19 +255,23 @@
         
         /**
          * 新增文章。
+         * @param {string} title 
+         * @param {string} summary 
+         * @param {string} content 
+         * @param {string} imageUrl - 直接的圖片 URL
          */
-        async function addPost(title, summary, content, imageUrlPrompt) {
+        async function addPost(title, summary, content, imageUrl) {
             if (state.currentUser?.role !== 'admin') {
                 throw new Error("權限不足：只有管理員才能新增文章。");
             }
-            // 後端將負責生成圖片並儲存到 D1 和 KV
+            // 後端 Worker 假設只需儲存 URL
             await fetchAPI('/posts', {
                 method: 'POST',
                 body: JSON.stringify({ 
                     title, 
                     summary, 
                     content, 
-                    imageUrlPrompt,
+                    imageUrl,
                     author: state.currentUser.username 
                 }),
             });
@@ -638,9 +640,9 @@
                             <input type="text" id="post-summary" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 shadow-sm" placeholder="文章摘要 (Summary)" required />
                             <textarea id="post-content" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 resize-y min-h-48 shadow-sm" placeholder="文章內容 (Content)" required></textarea>
                             <div class="p-4 bg-purple-50 rounded-lg border border-purple-200">
-                                <label class="block text-purple-700 font-bold mb-2">封面圖片生成提示詞 (Text-to-Image Prompt)</label>
-                                <input type="text" id="post-image-prompt" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 shadow-sm" placeholder="描述您希望生成的封面圖片" value="A minimalist, modern technology blog header image with abstract circuits, 4k" required />
-                                <p class="text-sm text-purple-500 mt-1"><i class="fas fa-magic mr-1"></i>此提示詞將在後端 Worker 中使用 \`imagen-4.0-generate-001\` 模型生成圖片，並儲存在 KV 中。</p>
+                                <label class="block text-purple-700 font-bold mb-2">封面圖片 URL</label>
+                                <input type="url" id="post-image-url" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 shadow-sm" placeholder="例如: https://picsum.photos/800/400" value="https://picsum.photos/800/400" required />
+                                <p class="text-sm text-purple-500 mt-1"><i class="fas fa-link mr-1"></i>請輸入一個有效的圖片網址，作為文章的封面圖。</p>
                             </div>
                             
                             <button
@@ -648,7 +650,7 @@
                                 id="add-post-btn"
                                 class="w-full px-6 py-3 rounded-lg text-white font-extrabold text-lg transition-colors duration-200 bg-purple-600 hover:bg-purple-700 shadow-xl focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2"
                             >
-                                <i class="fas fa-upload mr-2"></i> 發布文章與上傳圖片 (D1/KV/AI)
+                                <i class="fas fa-upload mr-2"></i> 發布新文章 (D1/KV)
                             </button>
                         </form>
                     </div>
@@ -686,21 +688,21 @@
                 const title = document.getElementById('post-title').value;
                 const summary = document.getElementById('post-summary').value;
                 const content = document.getElementById('post-content').value;
-                const imageUrlPrompt = document.getElementById('post-image-prompt').value;
+                const imageUrl = document.getElementById('post-image-url').value;
 
                 addPostBtn.disabled = true;
-                addPostBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> 圖片生成與發布中... (約 10-20 秒)';
+                addPostBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> 發布中...';
 
                 try {
-                    await addPost(title, summary, content, imageUrlPrompt);
-                    state.statusMessage = '文章發布成功！圖片已生成並儲存。';
+                    await addPost(title, summary, content, imageUrl);
+                    state.statusMessage = '文章發布成功！';
                     addPostForm.reset();
                 } catch (error) {
                     console.error(error);
                     state.statusMessage = `發布失敗: ${error.message}`;
                 } finally {
                     addPostBtn.disabled = false;
-                    addPostBtn.innerHTML = '<i class="fas fa-upload mr-2"></i> 發布文章與上傳圖片 (D1/KV/AI)';
+                    addPostBtn.innerHTML = '<i class="fas fa-upload mr-2"></i> 發布新文章 (D1/KV)';
                     renderApp(); // 重新渲染以更新列表和狀態消息
                 }
             });
