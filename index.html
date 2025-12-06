@@ -60,6 +60,10 @@
 
     <!-- JavaScript 邏輯 -->
     <script>
+        // --- 核心配置 ---
+        // 使用者提供的 Cloudflare Worker 後端網址，確保所有 API 呼叫的基礎路徑正確
+        const API_BASE_URL = 'https://tech-pulse-blog-api.kai1020622.workers.dev/api';
+        
         // --- 應用程式狀態管理 (Application State) ---
         const state = {
             currentView: 'list', // 'list', 'post', 'login', 'register', 'admin'
@@ -87,8 +91,8 @@
          * @returns {Promise<object | null>} - 響應 JSON.
          */
         async function fetchAPI(path, options = {}) {
-            // 注意: 在 Pages/Worker 環境中，這會自動代理到您的 Worker 路由
-            const url = `/api${path}`; 
+            // 使用絕對網址連接到 Worker 後端
+            const url = `${API_BASE_URL}${path}`; 
             const userToken = localStorage.getItem('userToken');
 
             const defaultHeaders = {
