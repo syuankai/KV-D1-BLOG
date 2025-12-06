@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>科技脈動 Blog - Cloudflare D1/AI Demo</title>
+    <!-- 引入 Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 引入 Font Awesome 5.15.4 (用於圖示) -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css">
+    <!-- 引入 Inter 字體 -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        main {
+            flex: 1;
+        }
+        .prose p {
+            margin-bottom: 1.5em;
+        }
+        .line-clamp-3 {
+            overflow: hidden;
+            display: -webkit-box;
+            -webkit-box-orient: vertical;
+            -webkit-line-clamp: 3;
+        }
+        .min-h-screen-minus-header {
+            /* 調整以適應實際的 header/footer 高度 */
+            min-height: calc(100vh - 150px); 
+        }
+    </style>
+</head>
+<body class="bg-gray-100">
+
+    <!-- 頂部導航欄 (Header) -->
+    <header id="header-container" class="sticky top-0 z-10 bg-white shadow-lg">
+        <!-- 內容將由 JavaScript 動態渲染 -->
+    </header>
+
+    <!-- 主內容區域 (Main Content) -->
+    <main id="app-container" class="pb-16">
+        <!-- 內容將由 JavaScript 動態渲染 -->
+        <div class="flex justify-center items-center p-10">
+            <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-500"></div>
+            <span class="ml-3 text-gray-600">應用程式啟動中...</span>
+        </div>
+    </main>
+
+    <!-- 底部版權資訊 (Footer) -->
+    <footer class="bg-gray-800 text-white p-6 text-center mt-auto">
+        <p class="text-sm">© <span id="current-year"></span> 科技脈動 Blog. 版權所有.</p>
+        <p class="text-xs mt-1">應用程式架構: Cloudflare Pages (Frontend) + Cloudflare Worker (Backend, D1/KV/AI).</p>
+        <p class="text-xs mt-1">當前用戶: <span id="current-user-info" class="font-mono text-indigo-400">正在檢查...</span></p>
+    </footer>
+
+    <!-- JavaScript 邏輯 -->
+    <script>
+        // --- 應用程式狀態管理 (Application State) ---
+        const state = {
+            currentView: 'list', // 'list', 'post', 'login', 'register', 'admin'
+            selectedPostId: null,
+            currentUser: null, // { id, username, role, token }
+            posts: [], // Array of Post objects
+            isPostsLoading: true,
+            error: '',
+            statusMessage: '' // For admin panel operations
+        };
+
+        // --- DOM 元素快取 (DOM Element Caches) ---
+        const headerContainer = document.getElementById('header-container');
+        const appContainer = document.getElementById('app-container');
+        const currentYearElement = document.getElementById('current-year');
+        const currentUserInfoElement = document.getElementById('current-user-info');
+        currentYearElement.textContent = new Date().getFullYear();
+
+        // --- 輔助函數 (Utility Functions) ---
+
+        /**
+         * 處理所有 API 請求，並處理認證標頭和錯誤。
+         * @param {string} path - API 路徑 (例如: '/posts').
+         * @param {object} options - Fetch 選項.
+         * @returns {Promise<object | null>} - 響應 JSON.
+         */
+        async function fetchAPI(path, options = {}) {
+            // 注意: 在 Pages/Worker 環境中，這會自動代理到您的 Worker 路由
+            const url = `/api${path}`; 
+            const userToken = localStorage.getItem('userToken');
+
+            const defaultHeaders = {
+                'Content-Type': 'application/json',
+                ...options.headers
+            };
+
+            if (userToken) {
+                defaultHeaders['Authorization'] = `Bearer ${userToken}`;
+            }
+
+            const response = await fetch(url, {
+                ...options,
+                headers: defaultHeaders,
+            });
+
+            if (!response.ok) {
+                let errorMessage = `API 錯誤：${response.status}`;
+                try {
+                    const errorBody = await response.json();
+                    errorMessage = errorBody.error || errorMessage;
+                } catch {
+                    // 如果響應不是 JSON，忽略
+                }
+                throw new Error(errorMessage);
+            }
+
+            if (response.status === 204) return null; // No Content
+            return response.json();
+        }
+        
+        /**
+         * 設置視圖並觸發重新渲染。
+         * @param {string} view - 新視圖名稱.
+         * @param {string} postId - 文章 ID (如果適用).
+         */
+        function setView(view, postId = null) {
+            state.currentView = view;
+            state.selectedPostId = postId;
+            state.error = '';
+            state.statusMessage = '';
+            renderApp();
+            window.scrollTo(0, 0); // 切換視圖時滾動到頂部
+        }
+
+        /**
+         * 顯示載入中的動畫。
+         * @returns {string} HTML string for spinner.
+         */
+        function LoadingSpinner() {
+            return `
+                <div class="flex flex-col justify-center items-center p-10 h-64">
+                    <div class="animate-spin rounded-full h-12 w-12 border-t-4 border-b-4 border-indigo-500"></div>
+                    <span class="mt-4 text-xl text-gray-600">載入中...</span>
+                </div>
+            `;
+        }
+
+        /**
+         * 顯示自定義通知。
+         */
+        function showNotification(message, isError = false) {
+            const notificationDiv = document.createElement('div');
+            notificationDiv.id = 'custom-notification';
+            notificationDiv.className = `fixed top-5 right-5 z-50 p-4 rounded-lg shadow-xl text-white font-semibold transition-all duration-300 ${isError ? 'bg-red-600' : 'bg-green-600'}`;
+            notificationDiv.textContent = message;
+
+            // 如果已有通知，先移除
+            const existing = document.getElementById('custom-notification');
+            if (existing) existing.remove();
+            
+            document.body.appendChild(notificationDiv);
+            
+            setTimeout(() => {
+                notificationDiv.classList.add('opacity-0');
+                notificationDiv.addEventListener('transitionend', () => notificationDiv.remove());
+            }, 3000);
+        }
+
+        // --- 認證邏輯 (Authentication Logic) ---
+
+        /**
+         * 處理登入或註冊。
+         */
+        async function authenticate(username, password, isLogin) {
+            const path = isLogin ? '/login' : '/register';
+            try {
+                const response = await fetchAPI(path, {
+                    method: 'POST',
+                    body: JSON.stringify({ username, password }),
+                });
+
+                if (response && response.user) {
+                    localStorage.setItem('userToken', response.user.token);
+                    state.currentUser = response.user;
+                    showNotification(`歡迎回來, ${response.user.username}！`, false);
+                    setView('list');
+                    return response.user;
+                }
+                return null;
+            } catch (error) {
+                throw new Error(error.message);
+            }
+        }
+
+        /**
+         * 登出並清除狀態。
+         */
+        function logout() {
+            localStorage.removeItem('userToken');
+            state.currentUser = null;
+            showNotification('您已成功登出。', false);
+            setView('list');
+        }
+
+        /**
+         * 初始化時檢查用戶 Token。
+         */
+        async function initAuth() {
+            const userToken = localStorage.getItem('userToken');
+            // 我們假設 token 存在即代表用戶會話有效
+            if (userToken) {
+                // 由於後端 Worker 使用 Token (即 userId) 進行身份驗證，我們在這裡模擬一個檢查。
+                // 為了避免每次刷新都觸發 API 請求，這裡先假設用戶已登入。
+                // 理想情況下，應該呼叫 /profile 端點來驗證 token 和獲取用戶角色。
+                const tokenPayload = userToken.split('.'); // 簡單解構 token
+                const username = tokenPayload[0] || 'User'; 
+                const role = tokenPayload[1] === 'admin' ? 'admin' : 'user';
+
+                state.currentUser = { 
+                    id: userToken, 
+                    username: username, 
+                    role: role, 
+                    token: userToken 
+                };
+            }
+        }
+
+
+        // --- 資料操作邏輯 (Data Operations) ---
+
+        /**
+         * 獲取所有文章列表。
+         */
+        async function fetchPosts() {
+            state.isPostsLoading = true;
+            renderHeader(); // 確保 header 狀態正確
+            appContainer.innerHTML = LoadingSpinner(); // 顯示載入狀態
+            
+            try {
+                const data = await fetchAPI('/posts');
+                // 解析 D1 儲存的 JSON 欄位
+                state.posts = data.posts.map(p => ({
+                    ...p,
+                    comments: JSON.parse(p.comments_json || '[]'),
+                    timestamp: parseInt(p.timestamp, 10),
+                })).sort((a, b) => b.timestamp - a.timestamp); // 根據時間戳排序
+            } catch (err) {
+                console.error("Failed to fetch posts:", err);
+                state.error = `無法載入文章：${err.message} (請確認您的 Cloudflare Worker 和 D1 綁定已正確部署)`;
+            } finally {
+                state.isPostsLoading = false;
+                renderApp();
+            }
+        }
+        
+        /**
+         * 新增文章。
+         */
+        async function addPost(title, summary, content, imageUrlPrompt) {
+            if (state.currentUser?.role !== 'admin') {
+                throw new Error("權限不足：只有管理員才能新增文章。");
+            }
+            // 後端將負責生成圖片並儲存到 D1 和 KV
+            await fetchAPI('/posts', {
+                method: 'POST',
+                body: JSON.stringify({ 
+                    title, 
+                    summary, 
+                    content, 
+                    imageUrlPrompt,
+                    author: state.currentUser.username 
+                }),
+            });
+            await fetchPosts(); // 重新載入列表
+        }
+
+        /**
+         * 刪除文章。
+         */
+        async function deletePost(postId) {
+            if (state.currentUser?.role !== 'admin') {
+                throw new Error("權限不足：只有管理員才能刪除文章。");
+            }
+            await fetchAPI(`/posts/${postId}`, { method: 'DELETE' });
+            await fetchPosts(); // 重新載入列表
+        }
+
+        /**
+         * 新增評論。
+         */
+        async function addComment(postId, content) {
+            if (!state.currentUser || state.currentUser.role === 'guest') {
+                throw new Error("權限不足：只有註冊用戶才能評論。");
+            }
+            await fetchAPI(`/posts/${postId}/comments`, {
+                method: 'POST',
+                body: JSON.stringify({ content, username: state.currentUser.username }),
+            });
+            await fetchPosts(); // 重新獲取文章以更新評論列表
+        }
+
+        // --- 渲染函數 (Render Functions) ---
+
+        /**
+         * 渲染頂部導航欄。
+         */
+        function renderHeader() {
+            const user = state.currentUser;
+            const authButtons = user ? `
+                ${user.role === 'admin' ? `
+                    <button onclick="setView('admin')" class="flex items-center space-x-2 px-4 py-2 text-white font-semibold rounded-lg shadow-md transition-all duration-200 bg-purple-600 hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2">
+                        <i class="fas fa-cogs"></i><span class="hidden sm:inline">管理面板</span>
+                    </button>
+                ` : ''}
+                <button onclick="logout()" class="flex items-center space-x-2 px-4 py-2 text-white font-semibold rounded-lg shadow-md transition-all duration-200 bg-red-500 hover:bg-red-600 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2">
+                    <i class="fas fa-sign-out-alt"></i><span class="hidden sm:inline">登出</span>
+                </button>
+            ` : `
+                <button onclick="setView('login')" class="flex items-center space-x-2 px-4 py-2 text-white font-semibold rounded-lg shadow-md transition-all duration-200 bg-indigo-500 hover:bg-indigo-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2">
+                    <i class="fas fa-sign-in-alt"></i><span class="hidden sm:inline">登入</span>
+                </button>
+                <button onclick="setView('register')" class="flex items-center space-x-2 px-4 py-2 text-white font-semibold rounded-lg shadow-md transition-all duration-200 bg-green-500 hover:bg-green-600 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2">
+                    <i class="fas fa-user-plus"></i><span class="hidden sm:inline">註冊</span>
+                </button>
+            `;
+
+            headerContainer.innerHTML = `
+                <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex justify-between items-center py-4">
+                    <div 
+                        class="text-2xl font-extrabold text-indigo-600 cursor-pointer transition-colors duration-200 hover:text-indigo-800"
+                        onclick="setView('list')"
+                    >
+                        <i class="fas fa-feather-alt mr-2"></i>科技脈動 Blog
+                    </div>
+                    <nav class="flex items-center space-x-2 sm:space-x-4">
+                        ${user ? `
+                            <span class="text-gray-700 font-medium hidden md:inline">
+                                歡迎, <span class="text-indigo-600 font-bold">${user.username} (${user.role === 'admin' ? '管理員' : '用戶'})</span>
+                            </span>
+                        ` : ''}
+                        ${authButtons}
+                    </nav>
+                </div>
+            `;
+
+            const userRoleText = user ? (user.role === 'admin' ? '管理員' : '用戶') : '未登入';
+            currentUserInfoElement.textContent = user ? `${user.username} (${userRoleText})` : '未登入';
+        }
+        
+        /**
+         * 渲染文章列表。
+         */
+        function renderPostList() {
+            const postCards = state.posts.length > 0 ? state.posts.map(post => {
+                const date = new Date(post.timestamp).toLocaleDateString('zh-TW', { year: 'numeric', month: 'long', day: 'numeric' });
+                const defaultImage = "https://placehold.co/800x400/9ca3af/ffffff?text=No%20Image";
+                return `
+                    <div 
+                        class="bg-white rounded-xl shadow-xl overflow-hidden cursor-pointer transform hover:scale-[1.02] transition duration-300 ring-2 ring-transparent hover:ring-indigo-400"
+                        onclick="setView('post', '${post.id}')"
+                    >
+                        <img 
+                            src="${post.imageUrl || defaultImage}" 
+                            alt="${post.title}" 
+                            class="w-full h-48 object-cover"
+                            onerror="this.onerror=null;this.src='${defaultImage}';"
+                        />
+                        <div class="p-6">
+                            <h2 class="text-2xl font-bold text-gray-900 mb-2 line-clamp-2">${post.title}</h2>
+                            <p class="text-gray-600 mb-4 line-clamp-3">${post.summary}</p>
+                            <div class="flex justify-between items-center text-sm text-gray-500 pt-2 border-t border-gray-100">
+                                <span><i class="fas fa-user mr-1 text-indigo-500"></i> ${post.author}</span>
+                                <span><i class="fas fa-clock mr-1 text-indigo-500"></i> ${date}</span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('') : `
+                <div class="col-span-full text-center p-10 bg-gray-50 rounded-lg border-2 border-dashed border-gray-300">
+                    <p class="text-2xl font-bold text-gray-500 mb-2"><i class="fas fa-exclamation-circle text-indigo-500"></i></p>
+                    <p class="text-xl text-gray-500">目前沒有文章，請管理員發布新內容。</p>
+                </div>
+            `;
+
+            appContainer.innerHTML = `
+                <div class="max-w-7xl mx-auto p-4 sm:p-6 lg:p-8">
+                    <h1 class="text-4xl font-extrabold text-gray-900 mb-8 border-b-4 border-indigo-500 pb-2">最新文章</h1>
+                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+                        ${postCards}
+                    </div>
+                </div>
+            `;
+        }
+        
+        /**
+         * 渲染單篇文章詳情和評論區。
+         */
+        function renderPostDetail() {
+            const post = state.posts.find(p => p.id === state.selectedPostId);
+            if (!post) {
+                appContainer.innerHTML = `<div class="text-center p-10 text-xl text-gray-500">文章未找到或已被刪除。</div>`;
+                return;
+            }
+
+            const defaultImage = "https://placehold.co/800x400/9ca3af/ffffff?text=No%20Image";
+            const date = new Date(post.timestamp).toLocaleDateString('zh-TW', { year: 'numeric', month: 'long', day: 'numeric' });
+            
+            // 渲染評論列表
+            const sortedComments = [...post.comments].sort((a, b) => b.timestamp - a.timestamp);
+            const commentsHtml = sortedComments.length > 0 ? sortedComments.map(comment => `
+                <div class="p-4 bg-white rounded-lg shadow-sm border border-gray-100">
+                    <div class="flex justify-between items-center mb-2">
+                        <span class="font-semibold text-indigo-600">${comment.username}</span>
+                        <span class="text-sm text-gray-400">${new Date(comment.timestamp).toLocaleString('zh-TW')}</span>
+                    </div>
+                    <p class="text-gray-700">${comment.content}</p>
+                </div>
+            `).join('') : '<p class="text-gray-500 text-center py-4">目前沒有評論。搶先發表您的看法！</p>';
+
+            // 渲染評論表單
+            const isUserLoggedIn = state.currentUser && state.currentUser.role !== 'guest';
+            const commentFormHtml = isUserLoggedIn ? `
+                <form id="comment-form" class="mb-8 p-6 bg-white rounded-xl shadow-lg border-t-4 border-indigo-500">
+                    <h4 class="text-xl font-bold mb-4 text-gray-800"><i class="fas fa-comment-dots mr-2 text-indigo-500"></i>留下您的評論</h4>
+                    <textarea id="comment-content" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 resize-y min-h-32 transition-shadow" placeholder="輸入您的評論內容..." required></textarea>
+                    <button type="submit" id="comment-submit-btn" disabled class="mt-3 px-6 py-2 rounded-lg font-semibold text-white transition-all duration-200 bg-gray-400 cursor-not-allowed shadow-md">
+                        發送評論
+                    </button>
+                </form>
+            ` : `
+                <div class="mb-8 p-6 bg-yellow-100 border border-yellow-300 rounded-lg text-yellow-800 flex flex-col sm:flex-row justify-between items-center shadow-md">
+                    <p class='font-medium'>
+                        <i class="fas fa-info-circle mr-2"></i>您需要 
+                        <span class="text-indigo-600 font-bold cursor-pointer hover:underline" onclick="setView('login')">登入</span> 或 
+                        <span class="text-green-600 font-bold cursor-pointer hover:underline" onclick="setView('register')">註冊</span> 
+                        才能發表評論。
+                    </p>
+                </div>
+            `;
+            
+            // 將文章內容分割成段落 (注意：Markdown/富文本支援需要更複雜的處理)
+            const contentParagraphs = post.content.split('\n').map(p => `<p class="mb-6">${p}</p>`).join('');
+
+            appContainer.innerHTML = `
+                <div class="max-w-4xl mx-auto p-4 sm:p-6 lg:p-8">
+                    <div class="bg-white rounded-xl shadow-2xl p-6 sm:p-8">
+                        <button 
+                            onclick="setView('list')"
+                            class="flex items-center text-indigo-600 hover:text-indigo-800 font-medium mb-6 transition-colors duration-200 focus:outline-none"
+                        >
+                            <i class="fas fa-arrow-left mr-2"></i> 返回文章列表
+                        </button>
+
+                        <h1 class="text-4xl font-extrabold text-gray-900 mb-4">${post.title}</h1>
+                        <div class="flex flex-wrap items-center text-gray-500 text-sm mb-8 space-x-4 border-b pb-4 border-gray-100">
+                            <span><i class="fas fa-user mr-1 text-indigo-500"></i> 作者: ${post.author}</span>
+                            <span><i class="fas fa-clock mr-1 text-indigo-500"></i> ${date}</span>
+                            <span><i class="fas fa-comment-alt mr-1 text-indigo-500"></i> 評論: ${post.comments.length}</span>
+                        </div>
+
+                        <div class="w-full h-80 sm:h-96 overflow-hidden rounded-lg mb-8 shadow-xl">
+                            <img 
+                                src="${post.imageUrl || defaultImage}" 
+                                alt="${post.title}" 
+                                class="w-full h-full object-cover"
+                                onerror="this.onerror=null;this.src='${defaultImage}';"
+                            />
+                        </div>
+
+                        <div class="prose max-w-none text-lg text-gray-800 leading-relaxed">
+                            ${contentParagraphs}
+                        </div>
+                    </div>
+
+                    <div class="mt-12 bg-gray-50 p-6 sm:p-8 rounded-xl shadow-inner border-t-4 border-gray-300">
+                        <h3 class="text-3xl font-bold text-gray-800 mb-6"><i class="fas fa-comments mr-2 text-indigo-600"></i>文章評論 (${post.comments.length})</h3>
+                        
+                        ${commentFormHtml}
+
+                        <div class="space-y-6">
+                            ${commentsHtml}
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            // 綁定評論事件監聽器
+            if (isUserLoggedIn) {
+                const commentForm = document.getElementById('comment-form');
+                const commentContent = document.getElementById('comment-content');
+                const submitBtn = document.getElementById('comment-submit-btn');
+
+                const updateSubmitButton = () => {
+                    const isValid = commentContent.value.trim().length > 0;
+                    submitBtn.disabled = !isValid;
+                    submitBtn.className = isValid
+                        ? 'mt-3 px-6 py-2 rounded-lg font-semibold text-white transition-all duration-200 bg-indigo-600 hover:bg-indigo-700 shadow-lg'
+                        : 'mt-3 px-6 py-2 rounded-lg font-semibold text-white transition-all duration-200 bg-gray-400 cursor-not-allowed shadow-md';
+                };
+
+                commentContent.addEventListener('input', updateSubmitButton);
+                updateSubmitButton(); // 初始檢查
+
+                commentForm.addEventListener('submit', async (e) => {
+                    e.preventDefault();
+                    const content = commentContent.value.trim();
+                    if (!content) return;
+                    
+                    submitBtn.disabled = true;
+                    submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>發送中...';
+
+                    try {
+                        await addComment(post.id, content);
+                        showNotification('評論發布成功！', false);
+                        commentContent.value = ''; // 清空表單
+                        setView('post', post.id); // 重新渲染文章詳情
+                    } catch (error) {
+                        showNotification(`評論發送失敗：${error.message}`, true);
+                    }
+                });
+            }
+        }
+
+        /**
+         * 渲染登入/註冊表單。
+         */
+        function renderAuthForm() {
+            const isLogin = state.currentView === 'login';
+            const title = isLogin ? '登入帳號' : '註冊新帳號';
+            const buttonText = isLogin ? '登入' : '註冊';
+            
+            appContainer.innerHTML = `
+                <div class="flex justify-center items-center p-4 min-h-screen-minus-header">
+                    <div class="w-full max-w-md bg-white p-8 rounded-xl shadow-2xl border-t-4 border-indigo-500">
+                        <h2 class="text-3xl font-extrabold text-gray-900 mb-6 text-center">${title}</h2>
+                        <div class="text-sm text-center text-gray-500 mb-6 p-3 bg-indigo-50 rounded-lg">
+                            ${isLogin ? 
+                                `<span>請使用<span class="font-mono text-indigo-600 font-bold"> admin / kai1020622 </span> 測試管理員功能。</span>`
+                                :
+                                `<span>註冊新帳號後，您將可以發表評論。</span>`
+                            }
+                        </div>
+                        <div id="auth-error-message" class="hidden p-3 mb-4 text-red-700 bg-red-100 rounded-lg font-medium border border-red-200"></div>
+                        
+                        <form id="auth-form" class="space-y-5">
+                            <input type="text" id="auth-username" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 shadow-sm" placeholder="用戶名" required />
+                            <input type="password" id="auth-password" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 shadow-sm" placeholder="密碼" required />
+                            <button type="submit" id="auth-submit-btn" class="w-full px-4 py-3 rounded-lg text-white font-semibold text-lg transition-colors duration-200 bg-indigo-600 hover:bg-indigo-700 shadow-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2">
+                                ${buttonText}
+                            </button>
+                        </form>
+
+                        <div class="mt-6 text-center text-sm">
+                            ${isLogin ? 
+                                `<p class="text-gray-600">還沒有帳號？ <span class="text-green-600 font-medium cursor-pointer hover:underline" onclick="setView('register')">立即註冊</span></p>`
+                                :
+                                `<p class="text-gray-600">已經有帳號？ <span class="text-indigo-600 font-medium cursor-pointer hover:underline" onclick="setView('login')">立即登入</span></p>`
+                            }
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            // 綁定表單事件
+            const form = document.getElementById('auth-form');
+            const usernameInput = document.getElementById('auth-username');
+            const passwordInput = document.getElementById('auth-password');
+            const submitBtn = document.getElementById('auth-submit-btn');
+            const errorDiv = document.getElementById('auth-error-message');
+
+            form.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                errorDiv.classList.add('hidden');
+                submitBtn.disabled = true;
+                submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>處理中...';
+
+                try {
+                    const user = await authenticate(usernameInput.value, passwordInput.value, isLogin);
+                    if (!user) {
+                        throw new Error(isLogin ? '用戶名或密碼錯誤，請重試。' : '註冊失敗，用戶名可能已被使用。');
+                    }
+                } catch (err) {
+                    errorDiv.textContent = err.message;
+                    errorDiv.classList.remove('hidden');
+                } finally {
+                    submitBtn.disabled = false;
+                    submitBtn.textContent = buttonText;
+                    renderHeader(); // 更新 Header 狀態
+                }
+            });
+        }
+        
+        /**
+         * 渲染管理員面板。
+         */
+        function renderAdminPanel() {
+            if (state.currentUser?.role !== 'admin') {
+                appContainer.innerHTML = `<div class="text-center p-10 text-xl text-red-500">錯誤：您沒有訪問此頁面的權限。</div>`;
+                return;
+            }
+
+            const sortedPosts = [...state.posts];
+            const postRows = sortedPosts.map((post) => `
+                <tr class="hover:bg-gray-50 transition duration-150">
+                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 truncate max-w-xs cursor-pointer hover:text-indigo-600" onclick="setView('post', '${post.id}')">${post.title}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 text-center">${post.comments.length}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${new Date(post.timestamp).toLocaleDateString('zh-TW')}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium text-center">
+                        <button
+                            onclick="handleDeletePost('${post.id}', '${post.title.replace(/'/g, "\\'")}')"
+                            class="text-red-600 hover:text-red-800 font-semibold transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 rounded-lg p-1"
+                        >
+                            <i class="fas fa-trash-alt mr-1"></i> 刪除
+                        </button>
+                    </td>
+                </tr>
+            `).join('');
+
+            const statusHtml = state.statusMessage ? `
+                <div id="admin-status-message" class="p-4 mb-6 rounded-lg font-semibold ${state.statusMessage.includes('失敗') ? 'bg-red-100 text-red-700 border border-red-300' : 'bg-green-100 text-green-700 border border-green-300'}">
+                    ${state.statusMessage}
+                </div>
+            ` : `<div id="admin-status-message"></div>`;
+
+            appContainer.innerHTML = `
+                <div class="max-w-7xl mx-auto p-4 sm:p-6 lg:p-8">
+                    <h1 class="text-4xl font-extrabold text-purple-600 mb-8 border-b-4 border-purple-500 pb-2"><i class="fas fa-user-shield mr-2"></i>管理員控制面板</h1>
+                    
+                    ${statusHtml}
+
+                    <!-- 發布新文章區塊 -->
+                    <div class="bg-white p-8 rounded-xl shadow-2xl mb-12 border-t-4 border-purple-400">
+                        <h2 class="text-3xl font-bold text-gray-900 mb-6"><i class="fas fa-plus-circle mr-2 text-purple-600"></i>發布新文章</h2>
+                        <form id="add-post-form" class="space-y-6">
+                            <input type="text" id="post-title" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 shadow-sm" placeholder="文章標題" required />
+                            <input type="text" id="post-summary" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 shadow-sm" placeholder="文章摘要 (Summary)" required />
+                            <textarea id="post-content" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 resize-y min-h-48 shadow-sm" placeholder="文章內容 (Content)" required></textarea>
+                            <div class="p-4 bg-purple-50 rounded-lg border border-purple-200">
+                                <label class="block text-purple-700 font-bold mb-2">封面圖片生成提示詞 (Text-to-Image Prompt)</label>
+                                <input type="text" id="post-image-prompt" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 shadow-sm" placeholder="描述您希望生成的封面圖片" value="A minimalist, modern technology blog header image with abstract circuits, 4k" required />
+                                <p class="text-sm text-purple-500 mt-1"><i class="fas fa-magic mr-1"></i>此提示詞將在後端 Worker 中使用 \`imagen-4.0-generate-001\` 模型生成圖片，並儲存在 KV 中。</p>
+                            </div>
+                            
+                            <button
+                                type="submit"
+                                id="add-post-btn"
+                                class="w-full px-6 py-3 rounded-lg text-white font-extrabold text-lg transition-colors duration-200 bg-purple-600 hover:bg-purple-700 shadow-xl focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2"
+                            >
+                                <i class="fas fa-upload mr-2"></i> 發布文章與上傳圖片 (D1/KV/AI)
+                            </button>
+                        </form>
+                    </div>
+
+                    <!-- 文章管理列表 -->
+                    <div class="bg-white p-8 rounded-xl shadow-2xl border-t-4 border-gray-400">
+                        <h2 class="text-3xl font-bold text-gray-900 mb-6"><i class="fas fa-list-alt mr-2 text-purple-600"></i>已發布文章列表</h2>
+                        <div class="overflow-x-auto shadow-md rounded-lg">
+                            <table class="min-w-full divide-y divide-gray-200">
+                                <thead class="bg-gray-50">
+                                    <tr>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">標題</th>
+                                        <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">評論數</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">發布日期</th>
+                                        <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="bg-white divide-y divide-gray-200">
+                                    ${postRows}
+                                </tbody>
+                            </table>
+                        </div>
+                        ${state.posts.length === 0 ? `<p class="text-center text-gray-500 py-6">尚無任何文章。</p>` : ''}
+                    </div>
+                </div>
+            `;
+            
+            // 綁定發布文章事件
+            const addPostForm = document.getElementById('add-post-form');
+            const addPostBtn = document.getElementById('add-post-btn');
+
+            addPostForm.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                
+                const title = document.getElementById('post-title').value;
+                const summary = document.getElementById('post-summary').value;
+                const content = document.getElementById('post-content').value;
+                const imageUrlPrompt = document.getElementById('post-image-prompt').value;
+
+                addPostBtn.disabled = true;
+                addPostBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> 圖片生成與發布中... (約 10-20 秒)';
+
+                try {
+                    await addPost(title, summary, content, imageUrlPrompt);
+                    state.statusMessage = '文章發布成功！圖片已生成並儲存。';
+                    addPostForm.reset();
+                } catch (error) {
+                    console.error(error);
+                    state.statusMessage = `發布失敗: ${error.message}`;
+                } finally {
+                    addPostBtn.disabled = false;
+                    addPostBtn.innerHTML = '<i class="fas fa-upload mr-2"></i> 發布文章與上傳圖片 (D1/KV/AI)';
+                    renderApp(); // 重新渲染以更新列表和狀態消息
+                }
+            });
+        }
+        
+        /**
+         * 處理刪除文章的點擊事件 (需要是全域函數)。
+         */
+        window.handleDeletePost = async (postId, postTitle) => {
+            // 使用自定義的 modal/confirm 替代 alert/confirm
+            if (!confirm(`確定要刪除文章 "${postTitle}" 嗎？此操作無法撤銷。`)) return;
+
+            try {
+                await deletePost(postId);
+                state.statusMessage = `文章 "${postTitle}" 已成功刪除。`;
+                showNotification(`文章 "${postTitle}" 已刪除。`, false);
+            } catch (error) {
+                state.statusMessage = `刪除失敗: ${error.message}`;
+                showNotification(`刪除失敗: ${error.message}`, true);
+            } finally {
+                renderApp(); // 重新渲染以更新列表和狀態消息
+            }
+        };
+
+        /**
+         * 主渲染函數：根據當前狀態渲染整個應用程式。
+         */
+        function renderApp() {
+            renderHeader();
+
+            if (state.isPostsLoading) {
+                // Loading spinner handled within fetchPosts/init
+                return;
+            }
+
+            if (state.error) {
+                appContainer.innerHTML = `<div class="p-6 text-center text-xl text-red-700 bg-red-100 rounded-lg max-w-7xl mx-auto my-8 border border-red-300 shadow-md">${state.error}</div>`;
+                return;
+            }
+
+            switch (state.currentView) {
+                case 'list':
+                    renderPostList();
+                    break;
+                case 'post':
+                    renderPostDetail();
+                    break;
+                case 'login':
+                case 'register':
+                    renderAuthForm();
+                    break;
+                case 'admin':
+                    renderAdminPanel();
+                    break;
+                default:
+                    renderPostList();
+            }
+        }
+
+        // --- 應用程式啟動 (App Initialization) ---
+        document.addEventListener('DOMContentLoaded', async () => {
+            await initAuth(); // 檢查用戶 Token
+            await fetchPosts(); // 獲取文章列表並觸發首次渲染
+        });
+
+    </script>
+</body>
+</html>
