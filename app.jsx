@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { LogOut, PlusSquare, Home, User } from 'lucide-react';
 
 // API Configuration
-const API_BASE_URL = '/api'; // Assuming /api routes to the Cloudflare Worker
+const API_BASE_URL = '/api'; // 假設 /api 路由到 Cloudflare Worker
 
 // Utility Function for API Calls
 const apiFetch = async (endpoint, options = {}) => {
@@ -20,12 +20,19 @@ const apiFetch = async (endpoint, options = {}) => {
         headers,
     });
     
-    // Handle 204 No Content explicitly
+    // 處理 204 No Content
     if (response.status === 204) {
         return null;
     }
 
-    const data = await response.json();
+    // 嘗試解析 JSON，即使是非 2xx 狀態，Worker 也可能返回 JSON 錯誤
+    let data = {};
+    try {
+        data = await response.json();
+    } catch (e) {
+        // 如果無法解析 JSON，返回一個通用錯誤
+        throw new Error(`API 請求失敗，狀態碼: ${response.status}`);
+    }
     
     if (!response.ok) {
         throw new Error(data.error || 'API 請求失敗');
@@ -109,6 +116,7 @@ const Message = ({ type, text, onClose }) => {
         case 'error':
             colorClasses = "bg-red-100 border border-red-400 text-red-700";
             break;
+        case 'info':
         default:
             colorClasses = "bg-blue-100 border border-blue-400 text-blue-700";
     }
@@ -236,7 +244,7 @@ const PostList = ({ posts, setCurrentView, loading }) => {
                     key={post.id} 
                     className="bg-white p-6 rounded-xl shadow-lg hover:shadow-xl transition duration-300 transform hover:-translate-y-0.5 border border-gray-100 cursor-pointer"
                     onClick={
-                        // 【關鍵修復點 1】: 點擊時，確保傳遞 post.id 給 detail 視圖
+                        // 確保點擊時，傳遞 post.id 給 detail 視圖
                         () => setCurrentView({ name: 'detail', id: post.id })
                     }
                 >
@@ -258,13 +266,15 @@ const PostDetail = ({ postId, setCurrentView, setMessage, loading, setLoading })
     const [error, setError] = useState(null);
 
     const fetchPost = useCallback(async () => {
+        if (!postId) return; // 避免在沒有 ID 時運行
+
         setLoading(true);
         setError(null);
         setPost(null);
         setMessage({ type: '', text: '' });
 
         try {
-            // 【關鍵修復點 2】: 確保 API 呼叫的 URL 中包含了正確的 ID
+            // 確保 API 呼叫的 URL 中包含了正確的 ID
             const data = await apiFetch(`/posts/${postId}`, { method: 'GET' });
             
             if (data.post) {
@@ -287,13 +297,19 @@ const PostDetail = ({ postId, setCurrentView, setMessage, loading, setLoading })
         }
     }, [postId, fetchPost]);
 
-    if (loading || !postId) {
+    if (loading) {
         return (
             <div className="text-center p-20 text-gray-500">
                 <div className="animate-spin inline-block w-10 h-10 border-4 border-t-blue-500 border-gray-200 rounded-full"></div>
                 <p className="mt-4">正在載入文章詳情...</p>
             </div>
         );
+    }
+    
+    // 如果沒有 ID 且不在載入中，可能是導航錯誤，返回列表
+    if (!postId && !loading) {
+        setCurrentView({ name: 'list' });
+        return null;
     }
 
     if (error || !post) {
@@ -440,14 +456,12 @@ const App = () => {
     
     // 檢查本地存儲是否有 token
     useEffect(() => {
-        // 這裡可以選擇性地發送請求到 Worker 進行 token 驗證
-        // 為了簡化，我們只檢查 token 是否存在
         const token = localStorage.getItem('token');
         if (token) {
-            // 簡易解析 token 以獲取用戶名和角色
             try {
                 const parts = token.split('.');
                 if (parts.length === 3) {
+                    // 檢查 token 格式正確性，並設置用戶狀態
                     setUser({ username: parts[0], role: parts[1] });
                 } else {
                     localStorage.removeItem('token');
@@ -464,7 +478,8 @@ const App = () => {
         setMessage({ type: '', text: '' });
         try {
             const data = await apiFetch('/posts', { method: 'GET' });
-            setPosts(data.posts || []);
+            // 確保 data.posts 是一個陣列
+            setPosts(Array.isArray(data.posts) ? data.posts : []);
         } catch (error) {
             console.error("Fetch Posts Error:", error);
             setMessage({ type: 'error', text: error.message || '無法獲取文章列表。' });
@@ -475,7 +490,7 @@ const App = () => {
     }, []);
 
     useEffect(() => {
-        // 僅在視圖是 'list' 時獲取文章列表
+        // 僅在視圖是 'list' 時獲取文章列表，並在頁面載入時觸發一次
         if (currentView.name === 'list') {
             fetchPosts();
         }
@@ -507,7 +522,6 @@ const App = () => {
                     />
                 );
             case 'detail':
-                // 【關鍵修復點 3】: 傳遞正確的 ID
                 return (
                     <PostDetail 
                         postId={currentView.id} 
