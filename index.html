@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kai 的部落格 (HTML/JS)</title>
+    <!-- 引入 Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 引入 Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        /* 使用 Inter 字體 */
+        :root {
+            font-family: 'Inter', sans-serif;
+        }
+        /* 確保內容區域有足夠的空間 */
+        .content-container {
+            min-height: calc(100vh - 64px); /* 假設 Navbar 高度為 64px */
+        }
+        /* Prose 樣式用於文章內容 */
+        .prose {
+            max-width: none;
+        }
+        .prose pre {
+            background-color: #f4f4f5;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            overflow-x: auto;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 antialiased">
+
+    <!-- 應用程式主容器 -->
+    <div id="app-root">
+        <!-- 導航欄將被 JavaScript 注入 -->
+        <nav id="navbar"></nav>
+        
+        <!-- 內容區域 -->
+        <main class="p-4 sm:p-6 lg:p-8 content-container">
+            <div class="max-w-7xl mx-auto">
+                <!-- 訊息區域 -->
+                <div id="message-container"></div>
+                <!-- 主要視圖內容區域 -->
+                <div id="content-view">
+                    <!-- 內容將被 JavaScript 渲染 -->
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        // --- 核心狀態管理與配置 ---
+        const API_BASE_URL = '/api';
+        const APP_STATE = {
+            user: null,
+            view: { name: 'list', id: null }, // name: 'list' | 'login' | 'register' | 'create' | 'detail', id: number | null
+            posts: [],
+            message: { type: '', text: '' },
+            loading: false,
+        };
+
+        // DOM 元素引用
+        const $navbar = document.getElementById('navbar');
+        const $messageContainer = document.getElementById('message-container');
+        const $contentView = document.getElementById('content-view');
+
+        /**
+         * 更新應用程式狀態並重新渲染
+         * @param {object} newState - 要合併的新狀態片段
+         */
+        const updateState = (newState) => {
+            Object.assign(APP_STATE, newState);
+            renderApp();
+        };
+
+        // --- API 輔助函數 ---
+
+        /**
+         * 處理 API 請求，包含認證令牌和錯誤處理
+         * @param {string} endpoint - API 路徑 (e.g., '/posts', '/login')
+         * @param {object} options - Fetch 選項
+         * @returns {Promise<object>}
+         */
+        const apiFetch = async (endpoint, options = {}) => {
+            const token = localStorage.getItem('token');
+            const headers = {
+                'Content-Type': 'application/json',
+                ...options.headers,
+            };
+            if (token) {
+                headers['Authorization'] = `Bearer ${token}`;
+            }
+
+            // 實作指數退避 (Exponential Backoff) 進行重試
+            for (let i = 0; i < 3; i++) { // 最多重試 3 次
+                try {
+                    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+                        ...options,
+                        headers,
+                    });
+                    
+                    if (response.status === 204) return null;
+
+                    let data = {};
+                    try {
+                        data = await response.json();
+                    } catch (e) {
+                        if (response.status === 200) {
+                             // 如果是 200 OK 但沒有 JSON，可能是 Worker 返回了空內容
+                             return {}; 
+                        }
+                        throw new Error(`API 請求失敗，狀態碼: ${response.status}，無法解析響應。`);
+                    }
+                    
+                    if (!response.ok) {
+                        throw new Error(data.error || `API 請求失敗，狀態碼: ${response.status}`);
+                    }
+                    return data;
+
+                } catch (error) {
+                    if (i === 2) throw error; // 最後一次嘗試失敗，拋出錯誤
+                    // 指數退避等待
+                    await new Promise(resolve => setTimeout(resolve, Math.pow(2, i) * 1000));
+                }
+            }
+        };
+
+        // --- 認證與初始化 ---
+
+        /**
+         * 檢查本地令牌並設定用戶狀態
+         */
+        const checkAuth = () => {
+            const token = localStorage.getItem('token');
+            if (token) {
+                try {
+                    const parts = token.split('.');
+                    if (parts.length === 3) {
+                        updateState({ user: { username: parts[0], role: parts[1] } });
+                        return;
+                    }
+                } catch (e) {
+                    console.error("Token 解析失敗:", e);
+                }
+                localStorage.removeItem('token');
+            }
+            updateState({ user: null });
+        };
+
+        /**
+         * 登出功能
+         */
+        const logout = () => {
+            localStorage.removeItem('token');
+            updateState({ 
+                user: null, 
+                view: { name: 'list', id: null },
+                message: { type: 'info', text: '您已成功登出。' }
+            });
+        };
+
+        // --- 數據獲取 ---
+
+        /**
+         * 獲取文章列表
+         */
+        const fetchPosts = async () => {
+            if (APP_STATE.loading) return;
+            
+            updateState({ loading: true, message: { type: '', text: '' } });
+
+            try {
+                const data = await apiFetch('/posts', { method: 'GET' });
+                updateState({ 
+                    posts: Array.isArray(data.posts) ? data.posts : [],
+                    loading: false
+                });
+            } catch (error) {
+                console.error("Fetch Posts Error:", error);
+                updateState({ 
+                    message: { type: 'error', text: error.message || '無法獲取文章列表。' },
+                    posts: [],
+                    loading: false
+                });
+            }
+        };
+
+        // --- 渲染組件函數 ---
+
+        /**
+         * 渲染訊息組件
+         */
+        const renderMessage = () => {
+            const { type, text } = APP_STATE.message;
+            if (!text) {
+                $messageContainer.innerHTML = '';
+                return;
+            }
+
+            let colorClasses = "";
+            switch (type) {
+                case 'success':
+                    colorClasses = "bg-green-100 border border-green-400 text-green-700";
+                    break;
+                case 'error':
+                    colorClasses = "bg-red-100 border border-red-400 text-red-700";
+                    break;
+                case 'info':
+                default:
+                    colorClasses = "bg-blue-100 border border-blue-400 text-blue-700";
+            }
+
+            $messageContainer.innerHTML = `
+                <div class="p-4 mb-4 rounded-lg shadow-md flex justify-between items-center ${colorClasses}" role="alert">
+                    <span class="block sm:inline">${text}</span>
+                    <button class="text-xl font-semibold leading-none opacity-70 hover:opacity-100 ml-4" onclick="updateState({ message: { type: '', text: '' } })">
+                        &times;
+                    </button>
+                </div>
+            `;
+            // 讓訊息在 8 秒後自動消失
+            setTimeout(() => {
+                 if (APP_STATE.message.text === text) {
+                     updateState({ message: { type: '', text: '' } });
+                 }
+            }, 8000);
+        };
+
+        /**
+         * 渲染導航欄
+         */
+        const renderNavBar = () => {
+            const { user, view, loading } = APP_STATE;
+            
+            const isAdmin = user && user.role === 'admin';
+            const navHTML = `
+                <div class="bg-gray-800 text-white shadow-lg sticky top-0 z-10">
+                    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                        <div class="flex items-center justify-between h-16">
+                            <div class="flex items-center">
+                                <span 
+                                    class="text-2xl font-bold cursor-pointer text-indigo-400 hover:text-indigo-300 transition duration-150"
+                                    onclick="updateState({ view: { name: 'list', id: null } })"
+                                >
+                                    Kai's Blog
+                                </span>
+                            </div>
+                            <div class="flex items-center space-x-4">
+                                <!-- 首頁按鈕 -->
+                                <button 
+                                    onclick="updateState({ view: { name: 'list', id: null } })"
+                                    class="p-2 rounded-full transition duration-150 ${view.name === 'list' ? 'bg-indigo-600' : 'hover:bg-gray-700'}"
+                                    title="首頁"
+                                    ${loading ? 'disabled' : ''}
+                                >
+                                    ${lucide.toSvg('home', { class: 'w-6 h-6' })}
+                                </button>
+
+                                <!-- 新增文章按鈕 (Admin Only) -->
+                                ${isAdmin ? `
+                                <button 
+                                    onclick="updateState({ view: { name: 'create', id: null } })"
+                                    class="p-2 rounded-full transition duration-150 ${view.name === 'create' ? 'bg-indigo-600' : 'hover:bg-gray-700'}"
+                                    title="新增文章"
+                                    ${loading ? 'disabled' : ''}
+                                >
+                                    ${lucide.toSvg('plus-square', { class: 'w-6 h-6' })}
+                                </button>` : ''}
+                                
+                                <!-- 用戶信息/登入/登出 -->
+                                ${user ? `
+                                    <div class="flex items-center space-x-1 text-sm bg-gray-700 p-2 rounded-full">
+                                        ${lucide.toSvg('user', { class: 'w-4 h-4 text-green-400' })}
+                                        <span>${user.username} (${isAdmin ? '管理員' : '用戶'})</span>
+                                    </div>
+                                    <button 
+                                        onclick="logout()"
+                                        class="bg-red-600 hover:bg-red-700 text-white font-medium py-2 px-3 rounded-full flex items-center transition duration-150"
+                                        ${loading ? 'disabled' : ''}
+                                    >
+                                        ${lucide.toSvg('log-out', { class: 'w-5 h-5 mr-1' })}
+                                        登出
+                                    </button>
+                                ` : `
+                                    <button 
+                                        onclick="updateState({ view: { name: 'login', id: null } })"
+                                        class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-3 rounded-full transition duration-150 ${view.name === 'login' || view.name === 'register' ? 'bg-indigo-700' : ''}"
+                                        ${loading ? 'disabled' : ''}
+                                    >
+                                        登入/註冊
+                                    </button>
+                                `}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            $navbar.innerHTML = navHTML;
+        };
+
+        /**
+         * 渲染登入/註冊表單
+         */
+        const renderAuthForm = () => {
+            const { view, loading } = APP_STATE;
+            const isLogin = view.name === 'login';
+            const title = isLogin ? '用戶登入' : '用戶註冊';
+            const buttonText = isLogin ? '登入' : '註冊';
+            const switchText = isLogin ? '還沒有帳號？去註冊' : '已經有帳號？去登入';
+            const switchView = isLogin ? 'register' : 'login';
+
+            $contentView.innerHTML = `
+                <div class="max-w-md mx-auto mt-10 p-8 bg-white shadow-xl rounded-xl border border-gray-200">
+                    <h2 class="text-3xl font-bold text-center mb-6 text-gray-800">${title}</h2>
+                    <form id="auth-form">
+                        <div class="mb-4">
+                            <label class="block text-gray-700 text-sm font-bold mb-2" for="username">用戶名</label>
+                            <input class="shadow appearance-none border rounded w-full py-3 px-4 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500 transition duration-150"
+                                id="username" type="text" placeholder="請輸入用戶名" required ${loading ? 'disabled' : ''}>
+                        </div>
+                        <div class="mb-6">
+                            <label class="block text-gray-700 text-sm font-bold mb-2" for="password">密碼</label>
+                            <input class="shadow appearance-none border rounded w-full py-3 px-4 text-gray-700 mb-3 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500 transition duration-150"
+                                id="password" type="password" placeholder="******************" required ${loading ? 'disabled' : ''}>
+                        </div>
+                        <div class="flex flex-col items-center justify-between">
+                            <button
+                                class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-6 rounded-full focus:outline-none focus:shadow-outline w-full transition duration-150 ${loading ? 'opacity-50' : ''}"
+                                type="submit" ${loading ? 'disabled' : ''}>
+                                ${loading ? `${buttonText}中...` : buttonText}
+                            </button>
+                            <button
+                                type="button"
+                                class="inline-block align-baseline font-bold text-sm text-indigo-500 hover:text-indigo-800 mt-4"
+                                onclick="updateState({ view: { name: '${switchView}', id: null } })" ${loading ? 'disabled' : ''}>
+                                ${switchText}
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            `;
+
+            document.getElementById('auth-form').onsubmit = async (e) => {
+                e.preventDefault();
+                const username = document.getElementById('username').value;
+                const password = document.getElementById('password').value;
+
+                updateState({ loading: true, message: { type: '', text: '' } });
+
+                try {
+                    const endpoint = isLogin ? '/login' : '/register';
+                    const data = await apiFetch(endpoint, {
+                        method: 'POST',
+                        body: JSON.stringify({ username, password }),
+                    });
+                    
+                    localStorage.setItem('token', data.user.token);
+                    updateState({ 
+                        user: data.user, 
+                        view: { name: 'list', id: null }, 
+                        message: { type: 'success', text: data.message } 
+                    });
+                } catch (error) {
+                    console.error(error);
+                    updateState({ 
+                        message: { type: 'error', text: error.message || '操作失敗' },
+                        loading: false
+                    });
+                }
+            };
+        };
+
+
+        /**
+         * 渲染文章列表
+         */
+        const renderPostList = () => {
+            const { posts, loading } = APP_STATE;
+
+            let contentHTML = `
+                <div class="max-w-4xl mx-auto mt-8 space-y-6">
+                    <h2 class="text-4xl font-extrabold text-gray-900 text-center mb-8 border-b-2 pb-2">最新文章</h2>
+            `;
+
+            if (loading) {
+                contentHTML += `
+                    <div class="text-center p-10 text-gray-500">
+                        <div class="animate-spin inline-block w-8 h-8 border-4 border-t-blue-500 border-gray-200 rounded-full"></div>
+                        <p class="mt-2">正在加載文章...</p>
+                    </div>
+                `;
+            } else if (posts.length === 0) {
+                contentHTML += `
+                    <div class="text-center p-10 text-gray-500 border-dashed border-2 rounded-lg">
+                        <p class="text-lg">目前沒有任何文章。管理員可以點擊 '+' 創建新文章。</p>
+                    </div>
+                `;
+            } else {
+                posts.forEach(post => {
+                    contentHTML += `
+                        <div 
+                            class="post-card bg-white p-6 rounded-xl shadow-lg hover:shadow-xl transition duration-300 transform hover:-translate-y-0.5 border border-gray-100 cursor-pointer"
+                            data-post-id="${post.id}"
+                        >
+                            <h3 class="text-2xl font-bold text-indigo-600 mb-2 truncate">${post.title}</h3>
+                            <p class="text-gray-600 mb-4 line-clamp-2">${post.content}</p>
+                            <div class="flex justify-between text-sm text-gray-400">
+                                <span>作者: ${post.author_name}</span>
+                                <span>發布於: ${new Date(post.created_at).toLocaleDateString('zh-TW')}</span>
+                            </div>
+                        </div>
+                    `;
+                });
+            }
+
+            contentHTML += '</div>';
+            $contentView.innerHTML = contentHTML;
+
+            // 添加事件監聽器到每張文章卡片
+            $contentView.querySelectorAll('.post-card').forEach(card => {
+                card.addEventListener('click', () => {
+                    const postId = parseInt(card.dataset.postId);
+                    if (postId) {
+                        // 【關鍵修復點】: 點擊時，正確設定 view 為 'detail' 和文章 ID
+                        updateState({ view: { name: 'detail', id: postId } });
+                    }
+                });
+            });
+        };
+
+        /**
+         * 渲染單篇文章詳情
+         */
+        const renderPostDetail = async () => {
+            const postId = APP_STATE.view.id;
+            
+            if (!postId) {
+                updateState({ view: { name: 'list', id: null } });
+                return;
+            }
+
+            // 顯示載入中
+            $contentView.innerHTML = `
+                <div class="text-center p-20 text-gray-500">
+                    <div class="animate-spin inline-block w-10 h-10 border-4 border-t-blue-500 border-gray-200 rounded-full"></div>
+                    <p class="mt-4">正在載入文章詳情...</p>
+                </div>
+            `;
+            updateState({ loading: true, message: { type: '', text: '' } });
+
+            let post = null;
+            let error = null;
+
+            try {
+                // 【核心修復點】: 確保呼叫帶有 ID 的詳情 API
+                const data = await apiFetch(`/posts/${postId}`, { method: 'GET' });
+                if (data && data.post) {
+                    post = data.post;
+                } else {
+                    error = "文章載入失敗：無效的響應格式。";
+                }
+            } catch (err) {
+                console.error("Fetch Post Error:", err);
+                error = err.message || '文章未找到或已被刪除。';
+                updateState({ message: { type: 'error', text: error } });
+            } finally {
+                updateState({ loading: false });
+            }
+
+            if (error || !post) {
+                $contentView.innerHTML = `
+                    <div class="max-w-4xl mx-auto mt-10 p-8 bg-red-50 rounded-xl shadow-lg border border-red-200 text-center">
+                        <h2 class="text-3xl font-bold text-red-600 mb-4">錯誤</h2>
+                        <p class="text-lg text-red-700">${error || "文章未找到或載入失敗。"}</p>
+                        <button 
+                            onclick="updateState({ view: { name: 'list', id: null } })"
+                            class="mt-6 bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded-full transition duration-150"
+                        >
+                            返回文章列表
+                        </button>
+                    </div>
+                `;
+                return;
+            }
+
+            $contentView.innerHTML = `
+                <div class="max-w-4xl mx-auto mt-10 p-8 bg-white rounded-xl shadow-2xl border border-gray-200">
+                    <h1 class="text-4xl font-extrabold text-gray-900 mb-4 border-b pb-2">${post.title}</h1>
+                    <div class="text-sm text-gray-500 mb-6 flex justify-between">
+                        <span>作者: <span class="font-semibold text-indigo-600">${post.author_name}</span></span>
+                        <span>發布於: ${new Date(post.created_at).toLocaleString('zh-TW')}</span>
+                    </div>
+                    <div class="prose max-w-none text-gray-700 leading-relaxed whitespace-pre-wrap">
+                        ${post.content.replace(/\n/g, '<br>')}
+                    </div>
+                    <button 
+                        onclick="updateState({ view: { name: 'list', id: null } })"
+                        class="mt-8 bg-indigo-500 hover:bg-indigo-600 text-white font-bold py-2 px-4 rounded-full transition duration-150"
+                    >
+                        &larr; 返回列表
+                    </button>
+                </div>
+            `;
+        };
+
+        /**
+         * 渲染創建文章表單
+         */
+        const renderCreatePost = () => {
+            const { user, loading } = APP_STATE;
+
+            if (!user || user.role !== 'admin') {
+                $contentView.innerHTML = `
+                    <div class="max-w-4xl mx-auto mt-10 p-8 bg-red-100 rounded-xl shadow-lg border border-red-300 text-center text-red-700">
+                        <h2 class="text-2xl font-bold mb-3">權限不足</h2>
+                        <p>只有管理員才能發布新文章。</p>
+                        <button 
+                            onclick="updateState({ view: { name: 'list', id: null } })"
+                            class="mt-6 bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded-full transition duration-150"
+                        >
+                            返回文章列表
+                        </button>
+                    </div>
+                `;
+                return;
+            }
+
+            $contentView.innerHTML = `
+                <div class="max-w-4xl mx-auto mt-10 p-8 bg-white shadow-xl rounded-xl border border-gray-200">
+                    <h2 class="text-3xl font-bold text-center mb-6 text-gray-800">創建新文章</h2>
+                    <form id="create-post-form">
+                        <div class="mb-4">
+                            <label class="block text-gray-700 text-sm font-bold mb-2" for="post-title">文章標題</label>
+                            <input
+                                class="shadow appearance-none border rounded w-full py-3 px-4 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500 transition duration-150"
+                                id="post-title" type="text" placeholder="請輸入文章標題" required ${loading ? 'disabled' : ''}>
+                        </div>
+                        <div class="mb-6">
+                            <label class="block text-gray-700 text-sm font-bold mb-2" for="post-content">文章內容</label>
+                            <textarea
+                                class="shadow appearance-none border rounded w-full py-3 px-4 text-gray-700 leading-tight h-64 focus:outline-none focus:ring-2 focus:ring-indigo-500 transition duration-150"
+                                id="post-content" placeholder="請輸入文章內容..." required ${loading ? 'disabled' : ''}></textarea>
+                        </div>
+                        <div class="flex items-center justify-center">
+                            <button
+                                class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-6 rounded-full focus:outline-none focus:shadow-outline w-full max-w-xs transition duration-150 ${loading ? 'opacity-50' : ''}"
+                                type="submit" ${loading ? 'disabled' : ''}>
+                                ${loading ? '發布中...' : '發布文章'}
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            `;
+
+            document.getElementById('create-post-form').onsubmit = async (e) => {
+                e.preventDefault();
+                const title = document.getElementById('post-title').value;
+                const content = document.getElementById('post-content').value;
+
+                updateState({ loading: true, message: { type: '', text: '' } });
+
+                try {
+                    const data = await apiFetch('/posts', {
+                        method: 'POST',
+                        body: JSON.stringify({ title, content }),
+                    });
+                    
+                    updateState({ 
+                        view: { name: 'list', id: null }, 
+                        message: { type: 'success', text: `文章發布成功: ${title}` } 
+                    });
+                } catch (error) {
+                    console.error(error);
+                    updateState({ 
+                        message: { type: 'error', text: error.message || '發布文章失敗' },
+                        loading: false
+                    });
+                }
+            };
+        };
+
+
+        // --- 主渲染邏輯 ---
+
+        /**
+         * 根據當前狀態渲染整個應用程式
+         */
+        const renderApp = () => {
+            renderNavBar();
+            renderMessage();
+
+            switch (APP_STATE.view.name) {
+                case 'login':
+                case 'register':
+                    renderAuthForm();
+                    break;
+                case 'create':
+                    renderCreatePost();
+                    break;
+                case 'detail':
+                    renderPostDetail();
+                    break;
+                case 'list':
+                default:
+                    renderPostList();
+                    // 確保在切換到列表視圖時獲取數據
+                    if (!APP_STATE.loading) {
+                         fetchPosts();
+                    }
+                    break;
+            }
+            // 重新渲染 Lucide 圖標
+            lucide.createIcons();
+        };
+
+        // --- 應用程式初始化 ---
+        window.onload = () => {
+            checkAuth(); // 檢查認證狀態
+            renderApp(); // 啟動渲染
+        };
+
+    </script>
+</body>
+</html>
